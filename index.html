@@ -5,242 +5,249 @@
     <title>Test Page</title>
 </head>
 <body>
-    <h1>import numpy as np
-import SimpleITK as sitk
-from skimage import measure
-import trimesh
-import os
+    <h1>import os
+import sys
 import argparse
-from typing import Tuple, List, Union
+import numpy as np
+import nrrd
+from typing import Tuple, Union, Dict
+import SimpleITK as sitk
 
-# --- 物理スケールと解像度設定 ---
-VOXEL_SIZE = 1.0
-SCALE_FACTOR = 1.0 / VOXEL_SIZE
-
-# --- 設定とパス ---
-BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
-OUTPUT_MESH_RELATIVE_PATH = "processed_meshes"
-OUTPUT_FULL_PATH = os.path.join(BASE_DIR, OUTPUT_MESH_RELATIVE_PATH)
-
-
-# --- ランダムな色生成ヘルパー ---
-def get_random_color(label_id: int) -> np.ndarray:
-    np.random.seed(label_id * 12345)
-    return np.random.randint(50, 256, 3, dtype=np.uint8)
-
-
-# -----------------------------------------------
-# NRRDファイルの読み込み (単体)
-# -----------------------------------------------
-def load_single_nrrd(nrrd_path: str) -> Union[sitk.Image, None]:
+# --- データロード関数 (NPZのみ) ---
+def load_npz_data(filepath: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    NPZファイルから座標 ('coords') とラベル ('instance_id' または 'label') を読み込み、
+    ユニークなラベルIDと再マッピングされたラベルを返す。
+    """
     try:
-        sitk_image = sitk.ReadImage(nrrd_path)
-        print(f" -> NRRDファイルを読み込みました: {os.path.basename(nrrd_path)}")
-        print(f" -> ボリューム形状: {sitk_image.GetSize()}")
-        return sitk_image
+        with np.load(filepath, allow_pickle=True) as data_npz:
+            
+            if 'coords' not in data_npz:
+                raise ValueError("NPZ file is missing 'coords' key.")
+            coords = data_npz['coords'].astype(np.float32)
+            
+            if 'instance_id' in data_npz:
+                labels = data_npz['instance_id'].flatten().astype(np.int32)
+            elif 'label' in data_npz:
+                labels = data_npz['label'].flatten().astype(np.int32)
+            else:
+                raise ValueError("NPZ file is missing 'instance_id' or 'label' key.")
+                
+            if coords.shape[0] != labels.shape[0]:
+                raise ValueError("Coordinate and label counts do not match.")
+
+            # ラベルのクリーンアップ (0以外のラベルを1から再マッピング)
+            valid_mask = labels >= 0
+            coords = coords[valid_mask]
+            labels = labels[valid_mask]
+            
+            # ラベルIDの再採番（SimpleITKのLabelMapとしてきれいに扱うため）
+            remapped_labels = np.zeros_like(labels)
+            unique_labels_raw = np.unique(labels)
+            
+            # 0以外の元のラベルと、新しい連続したラベルID（1, 2, 3...）のマッピングを保持
+            new_label_map = {}
+            new_id = 1
+            for old_id in unique_labels_raw:
+                if old_id != 0:
+                    new_label_map[old_id] = new_id
+                    remapped_labels[labels == old_id] = new_id
+                    new_id += 1
+            
+            # 最終的なユニークなラベルID (1, 2, 3...) を抽出
+            final_unique_labels = np.unique(remapped_labels)
+            final_unique_labels = final_unique_labels[final_unique_labels != 0]
+
+            return coords, remapped_labels, final_unique_labels, coords.shape[0]
+
     except Exception as e:
-        print(f"Error: NRRDファイルの読み込みに失敗しました ({os.path.basename(nrrd_path)}): {e}")
-        return None
+        raise ValueError(f"Failed to load NPZ data: {e}")
 
 
-# STEP 1: ラベルIDに基づいてバイナリマスクを抽出
-def create_label_mask(sitk_image, label_id):
-    binary_filter = sitk.BinaryThresholdImageFilter()
-    binary_filter.SetLowerThreshold(label_id)
-    binary_filter.SetUpperThreshold(label_id)
-    binary_filter.SetInsideValue(1)
-    binary_filter.SetOutsideValue(0)
-    label_mask = binary_filter.Execute(sitk_image)
-    return sitk.Cast(label_mask, sitk.sitkUInt8)
+def get_random_color(label_id: int) -> str:
+    """Slicer互換のランダムカラーを 'R G B' 形式で返す"""
+    np.random.seed(label_id * 12345)
+    r, g, b = np.random.randint(50, 256, 3)
+    return f"{r/255.0:.6f} {g/255.0:.6f} {b/255.0:.6f}"
 
 
-# STEP 2: 骨頭の中空から中実に（穴埋め処理）
-def fill_holes(sitk_binary_image):
+def save_to_nrrd_with_segments(
+    segmentation_map: np.ndarray, output_path: str, 
+    spacing: np.ndarray, origin: np.ndarray,  # origin は修正されたゼロ原点
+    unique_labels: np.ndarray, label_names: Dict[int, str]
+):
+    """
+    SimpleITKでNRRDを保存した後、Slicer互換のセグメント情報を追記する。
+    """
+    try:
+        import nrrd # nrrdライブラリがインストールされている前提
+
+        # 1. データをSimpleITK Imageに変換（SimpleITKの軸順序を維持）
+        image = sitk.GetImageFromArray(segmentation_map.transpose([2, 1, 0]))
+        image.SetSpacing(spacing.tolist())
+        image.SetOrigin(origin.tolist())  # 修正されたゼロ原点を使用
+        image = sitk.Cast(image, sitk.sitkUInt16)
+        
+        # 2. カスタムヘッダー情報の構築
+        custom_header = {
+            'space': 'left-posterior-superior', # Slicerの一般的な座標系
+        }
+        
+        # 3. 各セグメントのメタデータ（名前と色）を追加
+        segment_id_counter = 1
+        for label_value in unique_labels:
+            if label_value == 0: continue
+            
+            name = label_names.get(label_value, f"segment_{label_value}")
+            color = get_random_color(label_value)
+            
+            custom_header[f'Segment{segment_id_counter}_ID'] = f'Segment_{label_value}'
+            custom_header[f'Segment{segment_id_counter}_Name'] = name
+            custom_header[f'Segment{segment_id_counter}_LabelValue'] = str(label_value)
+            custom_header[f'Segment{segment_id_counter}_Color'] = color
+            custom_header[f'Segment{segment_id_counter}_Type'] = 'Tissue' # 仮の値
+            
+            segment_id_counter += 1
+            
+        custom_header['Segmentation_ExportedFrom'] = 'Python'
+        
+        # 4. nrrdライブラリを使ってデータを保存
+        data_to_write = sitk.GetArrayFromImage(image).transpose([2, 1, 0])
+        nrrd.write(output_path, data_to_write, header=custom_header)
+        
+        print(f"NRRD file saved to: {output_path} (Slicer LabelMap with Segments).")
+
+    except ImportError:
+        print("Error: 'nrrd' library is required for custom segment metadata. Please install it (pip install pynrrd).")
+        sitk.WriteImage(image, output_path)
+        print(f"NRRD file saved using SimpleITK (No Segment Names).")
+    except Exception as e:
+        print(f"Error during NRRD writing: {e}")
+        # フォールバックとしてSimpleITKで保存
+        sitk.WriteImage(image, output_path)
+        print(f"NRRD file saved using SimpleITK (Fallback).")
+
+
+def apply_sitk_dilation_and_smooth(sitk_image: sitk.Image) -> sitk.Image:
+    """SimpleITKのBinaryDilateとFillhole、Median Filterで水密化と平滑化を行う"""
+    
     fill_filter = sitk.BinaryFillholeImageFilter()
-    filled_image = fill_filter.Execute(sitk_binary_image)
-    return sitk.Cast(filled_image, sitk.sitkUInt8)
+    dilated_image = sitk.Image(sitk_image.GetSize(), sitk.sitkUInt16)
+    dilated_image.CopyInformation(sitk_image)
 
-
-# STEP 3: ボリューム平滑化 (無効化)
-# ⚠️ 高解像度データで体積消失の原因となるため、この関数は実行しません。
-def apply_volume_smoothing(sitk_binary_image, radius=4):    
-    print(f" -> INFO: BinaryMorphologicalOpening と Closing でボリューム平滑化を適用します (Radius: {radius} voxels)。")
-    # ... (元のロジックは保持するが、run_processing_pipelineでスキップ)
-    return sitk.Cast(sitk_binary_image, sitk.sitkUInt8)
-
-
-# STEP 4: メッシュ生成とファイル保存
-def generate_single_colored_mesh(sitk_image, label_id, is_right_side_fracture):
-    mask_array = sitk.GetArrayFromImage(sitk_image)
-        
-    if not np.any(mask_array): return None, "Volume empty"
-
-    # 1. マーチングキューブを実行 (生メッシュ - インデックス空間)
-    spacing = sitk_image.GetSpacing()
-    vertices_idx, faces, _, _ = measure.marching_cubes(mask_array, level=0.5, spacing=spacing)    
-
-    if vertices_idx.size == 0: return None, "Mesh is empty after initial MC"
-        
-    # 座標修正：手動計算でY軸とZ軸のインデックスを入れ替える (ねじれ解消の修正)
-    origin = np.array(sitk_image.GetOrigin())    
-        
-    mesh_vertices_phys = np.zeros_like(vertices_idx)
-
-    # X座標 (k) はそのまま
-    mesh_vertices_phys[:, 0] = vertices_idx[:, 2] * spacing[0] + origin[0]    
-        
-    # Y座標 ← Z軸のインデックス i を使用 (軸入れ替え)
-    mesh_vertices_phys[:, 1] = vertices_idx[:, 0] * spacing[1] + origin[1]    
-        
-    # Z座標 ← Y軸のインデックス j を使用 (軸入れ替え)
-    mesh_vertices_phys[:, 2] = vertices_idx[:, 1] * spacing[2] + origin[2]    
-        
-    # 新しい物理座標でメッシュを生成
-    mesh = trimesh.Trimesh(vertices=mesh_vertices_phys, faces=faces)
-        
-    # 空メッシュチェック
-    if mesh.is_empty or len(mesh.faces) == 0:    
-        return None, "Mesh is empty after coordinate transformation"
-        
-    if mesh.volume < 0:
-        mesh.faces = mesh.faces[:, ::-1]
-            
-    if is_right_side_fracture:
-        mirror_matrix = np.array([[-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-        mesh.apply_transform(mirror_matrix)
-
-    color = get_random_color(label_id)
-    mesh.visual.vertex_colors = np.tile(color, (len(mesh.vertices), 1))
-        
-    return mesh, "Success"
-
-
-# --- メイン実行関数 ---
-def run_processing_pipeline(nrrd_paths: List[str], is_right_side_fracture=False):
-    if len(nrrd_paths) != 1:
-        print("Error: 処理するNRRDファイルはMERGEDファイル1つのみを指定してください。")
-        return
-
-    # 1. NRRDファイルの読み込み (MERGEDのみ)
-    sitk_image_full = load_single_nrrd(nrrd_paths[0])
-    if sitk_image_full is None: return
-
-    # 2. ラベルの特定
     label_stats = sitk.LabelShapeStatisticsImageFilter()
-    label_stats.Execute(sitk_image_full)
-        
-    foreground_labels = [label for label in label_stats.GetLabels() if label != 0]
-
-    print(f"Step 0: {len(foreground_labels)}個のインスタンスIDに対して処理を実行します。")
-        
-    # 3. 各インスタンスIDに対する処理の反復
-    meshes_with_volumes = []
-    for label_id in foreground_labels:
-        print(f"\n--- Processing Label ID: {label_id} ---")
+    label_stats.Execute(sitk_image)
+    
+    for label in label_stats.GetLabels():
+        if label == 0:
+            continue
             
-        processed_image = create_label_mask(sitk_image_full, label_id)
-        filled_image = fill_holes(processed_image)
-            
-        # ⚠️ 体積消失エラー回避のため、apply_volume_smoothingはスキップし、filled_imageを直接使用
-        smoothed_volume = filled_image
-            
-        mesh, status = generate_single_colored_mesh(
-            smoothed_volume,    
-            label_id,
-            is_right_side_fracture
-        )
-            
-        if status == "Success" and mesh is not None:
-            # --- 簡略化 (Trimesh API修正と強化) ---
-            target_reduction_1 = 0.50 # 50%に削減
-            print(f" -> INFO: [1/2] 安定化のため{target_reduction_1*100:.0f}%に削減します。")
-            try:
-                initial_faces = len(mesh.faces)
-                target_faces = int(initial_faces * (1.0 - target_reduction_1))
-                
-                # 💡 修正: APIを target_reduction から target_faces に変更し、Trimesh v4.x APIに対応
-                mesh = trimesh.Trimesh.simplify_quadric_decimation(
-                    mesh,  # メッシュオブジェクトを引数として渡す
-                    target_faces=target_faces
-                )
-                print(f" -> INFO: 第1段階簡略化完了。ポリゴン数: {len(mesh.faces)}")
-            except Exception as e:
-                # APIエラーの場合はスキップ（依存関係の問題も含む）
-                print(f" -> WARNING: 簡略化中にエラーが発生しました (API/依存性): {e}. スキップします。")
-                
-            # --- 強力なTaubin平滑化 ---
-            NEW_ITERATIONS = 40 # 以前の15回から強化
-            try:
-                print(f" -> INFO: 強力なTaubin平滑化を適用します ({NEW_ITERATIONS}回)。")
-                mesh = trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.505, iterations=NEW_ITERATIONS)
-                print(" -> INFO: 最終平滑化処理完了。")
-            except Exception as e:
-                print(f" -> WARNING: 最終平滑化処理中にエラーが発生しました: {e}. スキップします。")
-                
-            meshes_with_volumes.append((mesh, mesh.volume))
-        else:
-            print(f" -> WARNING: Label ID {label_id} のメッシュ生成をスキップします。理由: {status}")
-
-    # --- 4. メッシュの結合と後処理 ---
-    if not meshes_with_volumes:
-        print("\n--- ERROR: 有効なメッシュが一つも生成されませんでした。終了します。 ---")
-        return
-
-    # 4.1. ノイズ除去
-    volumes = [mesh.volume for mesh, vol in meshes_with_volumes]
-    median_volume = np.median(volumes)
-    NOISE_THRESHOLD_FACTOR = 0.01
-    threshold_volume = median_volume * NOISE_THRESHOLD_FACTOR
+        current_mask = sitk.BinaryThreshold(sitk_image, label, label, 1, 0)
         
-    final_meshes = [mesh for mesh, vol in meshes_with_volumes if vol > threshold_volume]
-
-    if not final_meshes:
-        print("\n--- ERROR: ノイズ除去後、有効なメッシュが残っていません。終了します。 ---")
-        return
-
-    # ✅ メッシュを結合 (trimesh.util.concatenate)
-    final_mesh = trimesh.util.concatenate(final_meshes)
+        # 1. Binary Dilate (拡張)
+        dilation_filter = sitk.BinaryDilateImageFilter()
+        dilation_filter.SetKernelType(sitk.sitkBall)
+        dilation_filter.SetKernelRadius(3)
+        dilated_mask = dilation_filter.Execute(current_mask)
         
-    # 結合された最終メッシュ全体を原点中心に再配置 
-    final_mesh_center = final_mesh.bounding_box.centroid
-    final_mesh.apply_translation(-final_mesh_center)
-    print(f" -> INFO: 結合された全メッシュを原点中心に移動しました。")
-
-    if not os.path.exists(OUTPUT_FULL_PATH): os.makedirs(OUTPUT_FULL_PATH)
+        # 2. Binary Fillhole (穴埋め) を適用
+        filled_mask = fill_filter.Execute(dilated_mask) 
         
-    # 出力パス設定
-    base_file_name = os.path.splitext(os.path.basename(nrrd_paths[0]))[0]
-    # 出力ファイル名は結合された単一ファイルとなる
-    output_path = os.path.join(OUTPUT_FULL_PATH, f"{base_file_name}_FINAL_COMBINED_SURFACE.ply")
+        dilated_mask_with_label = sitk.Cast(filled_mask, sitk.sitkUInt16) * label
         
-    final_mesh.export(output_path, file_type='ply')
+        dilated_image = sitk.Maximum(dilated_image, dilated_mask_with_label)
         
-    print(f"\n--- Pipeline Finished ---")
-    print(f"✅ 最終的な結合された安定メッシュが {output_path} に保存されました。")
+    # --- 最終的なボリューム平滑化ステップ ---
+    
+    print(" -> INFO: SimpleITK Median Filter 適用中...")
+    median_filter = sitk.MedianImageFilter()
+    sitk_image_smoothed = median_filter.Execute(dilated_image)
+    
+    print(" -> INFO: SimpleITK Binary Closing 適用中 (Radius 2)...")
+    closing_filter = sitk.BinaryMorphologicalClosingImageFilter()
+    closing_filter.SetKernelType(sitk.sitkBall)
+    closing_filter.SetKernelRadius(2) 
+    
+    binary_all = sitk.BinaryThreshold(sitk_image_smoothed, 1, 65535, 1, 0)
+    closed_binary = closing_filter.Execute(binary_all)
+    
+    closed_np = sitk.GetArrayFromImage(closed_binary)
+    smoothed_np = sitk.GetArrayFromImage(sitk_image_smoothed)
+    
+    final_smoothed_np = np.where(closed_np, smoothed_np, 0)
+    
+    final_sitk_image = sitk.GetImageFromArray(final_smoothed_np)
+    final_sitk_image.CopyInformation(sitk_image)
+    
+    return final_sitk_image
 
 
-# -----------------------------------------------
-# コマンドライン引数処理ブロック (変更なし)
-# -----------------------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="単一のNRRDファイルからメッシュを生成するパイプライン。")
-    parser.add_argument('nrrd_path', type=str, help='入力NRRDファイルへのパス (MERGEDファイルのみを指定)。')
-    parser.add_argument('--right', action='store_true', help='メッシュを左右反転する場合に指定します。')
+def main():
+    parser = argparse.ArgumentParser(description="NPZファイルを使用し、セグメント名付きのNRRDを生成します。")
+    parser.add_argument('--label_npz_path', type=str, required=True, help='Path to the LABEL NPZ file.')
+    parser.add_argument('--output_dir', type=str, required=True, help='Path to the output directory.')
+    parser.add_argument('--base_name', type=str, required=True, help='Base name for output files.')
+    parser.add_argument('--voxel_size', type=float, default=0.25, help='Voxel size (e.g., 0.25mm).')
+    # 🆕 セグメント名マッピングを引数として追加
+    parser.add_argument('--label_names', type=str, default=None, help='カンマ区切りのラベルID:名前のペア (例: "1:pelvis,2:femoral_head")')
     args = parser.parse_args()
-        
-    nrrd_paths = [args.nrrd_path] if args.nrrd_path else []
+    
+    # ラベル名マッピングを解析
+    segment_label_map = {}
+    if args.label_names:
+        try:
+            for item in args.label_names.split(','):
+                label_id_str, name = item.split(':')
+                segment_label_map[int(label_id_str)] = name
+        except ValueError:
+            print("警告: --label_names の形式が正しくありません。'ID:名前,ID:名前' の形式で指定してください。")
+            
+    # --- 1. データ読み込みとPoint Cloud処理 ---
+    print(f"Loading data from NPZ: {args.label_npz_path}")
+    coords, labels, unique_labels, N_points = load_npz_data(args.label_npz_path)
+    
+    voxel_size = args.voxel_size
+    coords_min = np.min(coords, axis=0)
+    relative_coords = coords - coords_min[None] # 最小値を引いて相対座標に変換
+    voxel_indices = np.round(relative_coords / voxel_size).astype(np.int32)
+    
+    # 3. 3Dセグメンテーションマップの構築
+    max_indices = np.max(voxel_indices, axis=0)
+    grid_shape = tuple(max_indices + 1)
+    
+    segmentation_map_CLEANED_np = np.zeros(grid_shape, dtype=np.int32)
+    segmentation_map_CLEANED_np[voxel_indices[:, 0], voxel_indices[:, 1], voxel_indices[:, 2]] = labels
+    
+    # --- 4. SimpleITKによる高速な処理 (MERGED_SMOOTH 相当の生成) ---
+    sitk_image_cleaned = sitk.GetImageFromArray(segmentation_map_CLEANED_np.transpose([2, 1, 0]))
+    sitk_image_cleaned.SetSpacing(np.array([voxel_size]*3).tolist())
+    
+    # 💡 修正箇所：Originをゼロに設定し、座標オフセットを解除
+    # これにより、メッシュがビューアの原点付近に生成される
+    sitk_image_cleaned.SetOrigin([0.0, 0.0, 0.0]) 
+    
+    sitk_image_cleaned = sitk.Cast(sitk_image_cleaned, sitk.sitkUInt16)
 
-    valid_paths = [p for p in nrrd_paths if os.path.exists(p)]
-        
-    if len(valid_paths) != len(nrrd_paths):
-        missing_paths = [p for p in nrrd_paths if not os.path.exists(p)]
-        print(f"エラー: NRRDファイルが見つかりません: {missing_paths}")
-    elif not valid_paths:
-        print("エラー: 処理するNRRDファイルが指定されていません。")
-    else:
-        run_processing_pipeline(
-            valid_paths,
-            is_right_side_fracture=args.right
-        )</h1>
+    print(" -> SimpleITKの高速処理 (Dilation, Median, Closing) を適用中...")
+    
+    sitk_image_merged_smooth = apply_sitk_dilation_and_smooth(sitk_image_cleaned)
+    
+    # 出力 2: 拡張あり (MERGED_SMOOTH 相当)
+    merged_output_path = os.path.join(args.output_dir, f"{args.base_name}_MERGED_SMOOTH.nrrd")
+    
+    # 最終的なカスタムヘッダー付き保存を実行
+    save_to_nrrd_with_segments(
+        sitk.GetArrayFromImage(sitk_image_merged_smooth).transpose([2, 1, 0]), 
+        merged_output_path, 
+        np.array([voxel_size]*3), 
+        np.array([0.0, 0.0, 0.0]),  # 💡 修正箇所：NRRDヘッダーにもゼロ原点を書き込む
+        unique_labels, # NPZから抽出したユニークなラベルIDを渡す
+        segment_label_map # コマンドラインから読み込んだセグメント名を渡す
+    )
+    
+    print("Script finished. (Generated CLEANED and MERGED_SMOOTH NRRD files)")
+
+if __name__ == '__main__':
+    main()</h1>
 </body>
 </html>
