@@ -2,252 +2,52 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>Test Page</title>
+    <title>掲示板テスト</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
-    <h1>import os
-import sys
-import argparse
-import numpy as np
-import nrrd
-from typing import Tuple, Union, Dict
-import SimpleITK as sitk
+    <h1>掲示板</h1>
+    <input type="text" id="u" placeholder="名前">
+    <textarea id="m" placeholder="内容"></textarea>
+    <button onclick="send()">送信</button>
+    <div id="d">読み込み中...</div>
 
-# --- データロード関数 (NPZのみ) ---
-def load_npz_data(filepath: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """
-    NPZファイルから座標 ('coords') とラベル ('instance_id' または 'label') を読み込み、
-    ユニークなラベルIDと再マッピングされたラベルを返す。
-    """
-    try:
-        with np.load(filepath, allow_pickle=True) as data_npz:
+    <script>
+        const myApp = supabase.createClient('https://dcxjmocivftnoeanxozp.supabase.co', 'sb_publishable_jMGLh45RmTHYqf8oP-9ymw_T2eHxW-M');
+
+        async function load() {
+            // .order() を外すか、確実に存在する列名に変更
+            const { data, error } = await myApp.from('posts').select('*');
             
-            if 'coords' not in data_npz:
-                raise ValueError("NPZ file is missing 'coords' key.")
-            coords = data_npz['coords'].astype(np.float32)
-            
-            if 'instance_id' in data_npz:
-                labels = data_npz['instance_id'].flatten().astype(np.int32)
-            elif 'label' in data_npz:
-                labels = data_npz['label'].flatten().astype(np.int32)
-            else:
-                raise ValueError("NPZ file is missing 'instance_id' or 'label' key.")
-                
-            if coords.shape[0] != labels.shape[0]:
-                raise ValueError("Coordinate and label counts do not match.")
+            if (error) {
+                console.error("読み込みエラー:", error.message);
+                return;
+            }
 
-            # ラベルのクリーンアップ (0以外のラベルを1から再マッピング)
-            valid_mask = labels >= 0
-            coords = coords[valid_mask]
-            labels = labels[valid_mask]
-            
-            # ラベルIDの再採番（SimpleITKのLabelMapとしてきれいに扱うため）
-            remapped_labels = np.zeros_like(labels)
-            unique_labels_raw = np.unique(labels)
-            
-            # 0以外の元のラベルと、新しい連続したラベルID（1, 2, 3...）のマッピングを保持
-            new_label_map = {}
-            new_id = 1
-            for old_id in unique_labels_raw:
-                if old_id != 0:
-                    new_label_map[old_id] = new_id
-                    remapped_labels[labels == old_id] = new_id
-                    new_id += 1
-            
-            # 最終的なユニークなラベルID (1, 2, 3...) を抽出
-            final_unique_labels = np.unique(remapped_labels)
-            final_unique_labels = final_unique_labels[final_unique_labels != 0]
-
-            return coords, remapped_labels, final_unique_labels, coords.shape[0]
-
-    except Exception as e:
-        raise ValueError(f"Failed to load NPZ data: {e}")
-
-
-def get_random_color(label_id: int) -> str:
-    """Slicer互換のランダムカラーを 'R G B' 形式で返す"""
-    np.random.seed(label_id * 12345)
-    r, g, b = np.random.randint(50, 256, 3)
-    return f"{r/255.0:.6f} {g/255.0:.6f} {b/255.0:.6f}"
-
-
-def save_to_nrrd_with_segments(
-    segmentation_map: np.ndarray, output_path: str, 
-    spacing: np.ndarray, origin: np.ndarray,  # origin は修正されたゼロ原点
-    unique_labels: np.ndarray, label_names: Dict[int, str]
-):
-    """
-    SimpleITKでNRRDを保存した後、Slicer互換のセグメント情報を追記する。
-    """
-    try:
-        import nrrd # nrrdライブラリがインストールされている前提
-
-        # 1. データをSimpleITK Imageに変換（SimpleITKの軸順序を維持）
-        image = sitk.GetImageFromArray(segmentation_map.transpose([2, 1, 0]))
-        image.SetSpacing(spacing.tolist())
-        image.SetOrigin(origin.tolist())  # 修正されたゼロ原点を使用
-        image = sitk.Cast(image, sitk.sitkUInt16)
-        
-        # 2. カスタムヘッダー情報の構築
-        custom_header = {
-            'space': 'left-posterior-superior', # Slicerの一般的な座標系
+            if (data) {
+                // 新しいものが上にくるようにJS側で逆順にする
+                const reversedData = [...data].reverse();
+                document.getElementById('d').innerHTML = reversedData.map(p => `<p><b>${p.name || '名無し'}</b>: ${p.content}</p>`).join('');
+            }
         }
-        
-        # 3. 各セグメントのメタデータ（名前と色）を追加
-        segment_id_counter = 1
-        for label_value in unique_labels:
-            if label_value == 0: continue
+
+        async function send() {
+            const n = document.getElementById('u').value || "名無し";
+            const c = document.getElementById('m').value;
+            if (!c) return;
+
+            const { error } = await myApp.from('posts').insert([{ name: n, content: c }]);
             
-            name = label_names.get(label_value, f"segment_{label_value}")
-            color = get_random_color(label_value)
-            
-            custom_header[f'Segment{segment_id_counter}_ID'] = f'Segment_{label_value}'
-            custom_header[f'Segment{segment_id_counter}_Name'] = name
-            custom_header[f'Segment{segment_id_counter}_LabelValue'] = str(label_value)
-            custom_header[f'Segment{segment_id_counter}_Color'] = color
-            custom_header[f'Segment{segment_id_counter}_Type'] = 'Tissue' # 仮の値
-            
-            segment_id_counter += 1
-            
-        custom_header['Segmentation_ExportedFrom'] = 'Python'
-        
-        # 4. nrrdライブラリを使ってデータを保存
-        data_to_write = sitk.GetArrayFromImage(image).transpose([2, 1, 0])
-        nrrd.write(output_path, data_to_write, header=custom_header)
-        
-        print(f"NRRD file saved to: {output_path} (Slicer LabelMap with Segments).")
+            if (error) {
+                alert("送信エラー: " + error.message + "\nポリシーで 'anon' ロールが許可されているか確認してください。");
+            } else {
+                document.getElementById('m').value = "";
+                load();
+            }
+        }
 
-    except ImportError:
-        print("Error: 'nrrd' library is required for custom segment metadata. Please install it (pip install pynrrd).")
-        sitk.WriteImage(image, output_path)
-        print(f"NRRD file saved using SimpleITK (No Segment Names).")
-    except Exception as e:
-        print(f"Error during NRRD writing: {e}")
-        # フォールバックとしてSimpleITKで保存
-        sitk.WriteImage(image, output_path)
-        print(f"NRRD file saved using SimpleITK (Fallback).")
-
-
-def apply_sitk_dilation_and_smooth(sitk_image: sitk.Image) -> sitk.Image:
-    """SimpleITKのBinaryDilateとFillhole、Median Filterで水密化と平滑化を行う"""
-    
-    fill_filter = sitk.BinaryFillholeImageFilter()
-    dilated_image = sitk.Image(sitk_image.GetSize(), sitk.sitkUInt16)
-    dilated_image.CopyInformation(sitk_image)
-
-    label_stats = sitk.LabelShapeStatisticsImageFilter()
-    label_stats.Execute(sitk_image)
-    
-    for label in label_stats.GetLabels():
-        if label == 0:
-            continue
-            
-        current_mask = sitk.BinaryThreshold(sitk_image, label, label, 1, 0)
-        
-        # 1. Binary Dilate (拡張)
-        dilation_filter = sitk.BinaryDilateImageFilter()
-        dilation_filter.SetKernelType(sitk.sitkBall)
-        dilation_filter.SetKernelRadius(3)
-        dilated_mask = dilation_filter.Execute(current_mask)
-        
-        # 2. Binary Fillhole (穴埋め) を適用
-        filled_mask = fill_filter.Execute(dilated_mask) 
-        
-        dilated_mask_with_label = sitk.Cast(filled_mask, sitk.sitkUInt16) * label
-        
-        dilated_image = sitk.Maximum(dilated_image, dilated_mask_with_label)
-        
-    # --- 最終的なボリューム平滑化ステップ ---
-    
-    print(" -> INFO: SimpleITK Median Filter 適用中...")
-    median_filter = sitk.MedianImageFilter()
-    sitk_image_smoothed = median_filter.Execute(dilated_image)
-    
-    print(" -> INFO: SimpleITK Binary Closing 適用中 (Radius 2)...")
-    closing_filter = sitk.BinaryMorphologicalClosingImageFilter()
-    closing_filter.SetKernelType(sitk.sitkBall)
-    closing_filter.SetKernelRadius(2) 
-    
-    binary_all = sitk.BinaryThreshold(sitk_image_smoothed, 1, 65535, 1, 0)
-    closed_binary = closing_filter.Execute(binary_all)
-    
-    closed_np = sitk.GetArrayFromImage(closed_binary)
-    smoothed_np = sitk.GetArrayFromImage(sitk_image_smoothed)
-    
-    final_smoothed_np = np.where(closed_np, smoothed_np, 0)
-    
-    final_sitk_image = sitk.GetImageFromArray(final_smoothed_np)
-    final_sitk_image.CopyInformation(sitk_image)
-    
-    return final_sitk_image
-
-
-def main():
-    parser = argparse.ArgumentParser(description="NPZファイルを使用し、セグメント名付きのNRRDを生成します。")
-    parser.add_argument('--label_npz_path', type=str, required=True, help='Path to the LABEL NPZ file.')
-    parser.add_argument('--output_dir', type=str, required=True, help='Path to the output directory.')
-    parser.add_argument('--base_name', type=str, required=True, help='Base name for output files.')
-    parser.add_argument('--voxel_size', type=float, default=0.25, help='Voxel size (e.g., 0.25mm).')
-    # 🆕 セグメント名マッピングを引数として追加
-    parser.add_argument('--label_names', type=str, default=None, help='カンマ区切りのラベルID:名前のペア (例: "1:pelvis,2:femoral_head")')
-    args = parser.parse_args()
-    
-    # ラベル名マッピングを解析
-    segment_label_map = {}
-    if args.label_names:
-        try:
-            for item in args.label_names.split(','):
-                label_id_str, name = item.split(':')
-                segment_label_map[int(label_id_str)] = name
-        except ValueError:
-            print("警告: --label_names の形式が正しくありません。'ID:名前,ID:名前' の形式で指定してください。")
-            
-    # --- 1. データ読み込みとPoint Cloud処理 ---
-    print(f"Loading data from NPZ: {args.label_npz_path}")
-    coords, labels, unique_labels, N_points = load_npz_data(args.label_npz_path)
-    
-    voxel_size = args.voxel_size
-    coords_min = np.min(coords, axis=0)
-    relative_coords = coords - coords_min[None] # 最小値を引いて相対座標に変換
-    voxel_indices = np.round(relative_coords / voxel_size).astype(np.int32)
-    
-    # 3. 3Dセグメンテーションマップの構築
-    max_indices = np.max(voxel_indices, axis=0)
-    grid_shape = tuple(max_indices + 1)
-    
-    segmentation_map_CLEANED_np = np.zeros(grid_shape, dtype=np.int32)
-    segmentation_map_CLEANED_np[voxel_indices[:, 0], voxel_indices[:, 1], voxel_indices[:, 2]] = labels
-    
-    # --- 4. SimpleITKによる高速な処理 (MERGED_SMOOTH 相当の生成) ---
-    sitk_image_cleaned = sitk.GetImageFromArray(segmentation_map_CLEANED_np.transpose([2, 1, 0]))
-    sitk_image_cleaned.SetSpacing(np.array([voxel_size]*3).tolist())
-    
-    # 💡 修正箇所：Originをゼロに設定し、座標オフセットを解除
-    # これにより、メッシュがビューアの原点付近に生成される
-    sitk_image_cleaned.SetOrigin([0.0, 0.0, 0.0]) 
-    
-    sitk_image_cleaned = sitk.Cast(sitk_image_cleaned, sitk.sitkUInt16)
-
-    print(" -> SimpleITKの高速処理 (Dilation, Median, Closing) を適用中...")
-    
-    sitk_image_merged_smooth = apply_sitk_dilation_and_smooth(sitk_image_cleaned)
-    
-    # 出力 2: 拡張あり (MERGED_SMOOTH 相当)
-    merged_output_path = os.path.join(args.output_dir, f"{args.base_name}_MERGED_SMOOTH.nrrd")
-    
-    # 最終的なカスタムヘッダー付き保存を実行
-    save_to_nrrd_with_segments(
-        sitk.GetArrayFromImage(sitk_image_merged_smooth).transpose([2, 1, 0]), 
-        merged_output_path, 
-        np.array([voxel_size]*3), 
-        np.array([0.0, 0.0, 0.0]),  # 💡 修正箇所：NRRDヘッダーにもゼロ原点を書き込む
-        unique_labels, # NPZから抽出したユニークなラベルIDを渡す
-        segment_label_map # コマンドラインから読み込んだセグメント名を渡す
-    )
-    
-    print("Script finished. (Generated CLEANED and MERGED_SMOOTH NRRD files)")
-
-if __name__ == '__main__':
-    main()</h1>
+        load();
+        setInterval(load, 5000);
+    </script>
 </body>
 </html>
