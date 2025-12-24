@@ -4,6 +4,15 @@
     <meta charset="UTF-8">
     <title>掲示板テスト</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        /* 表示エリアの改行を有効にする */
+        #d p {
+            white-space: pre-wrap; /* これで改行がそのまま表示されます */
+            word-wrap: break-word; /* 長い単語の折り返し設定 */
+            border-bottom: 1px solid #eee;
+            padding: 10px;
+        }
+    </style>
 </head>
 <body>
     <h1>掲示板</h1>
